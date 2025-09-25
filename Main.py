@@ -8,13 +8,13 @@ import warnings
 warnings.filterwarnings('ignore')
 
 class EnhancedLeakDetector:
-    def __init__(self, sampling_rate=50000000, pipe_length=0.8):
+    def __init__(self, sampling_rate=50000000, pipe_length=1.0):
         self.sampling_rate = sampling_rate
         self.pipe_length = pipe_length
         self.dt = 1.0 / sampling_rate
         self.downsample_factor = 100
         self.effective_sampling_rate = sampling_rate / self.downsample_factor
-        self.effective_dt = 1.0 / self.effective_sampling_rate
+        self.effective_dt = 1 / self.effective_sampling_rate
         self.speed_of_sound = 1480
         
     def load_and_preprocess(self, filepath, time_col=0, signal_col=1):
@@ -59,21 +59,28 @@ class EnhancedLeakDetector:
             b, a = butter(4, [low, high], btype='band')
         return filtfilt(b, a, signal)
         
-    def find_direct_pulse(self, signal, method='energy'):
+    def find_direct_pulse(self, signal, method='peak'):
+        # First, let's find the approximate location of the direct pulse
+        # Look for the first major peak in the signal
         if method == 'energy':
             window_size = int(0.0001 / self.effective_dt)
             energy = np.convolve(signal**2, np.ones(window_size)/window_size, mode='same')
             pulse_start = np.argmax(energy)
             return pulse_start
         elif method == 'peak':
-            return np.argmax(np.abs(signal))
+            # Find the first significant peak in the signal
+            peaks, _ = find_peaks(np.abs(signal), height=np.max(np.abs(signal))*0.5, distance=int(0.0001/self.effective_dt))
+            if len(peaks) > 0:
+                return peaks[0]
+            else:
+                return np.argmax(np.abs(signal))
         elif method == 'matched_filter':
             template = np.exp(-np.linspace(-3, 3, 100)**2) * np.sin(2 * np.pi * 10000 * np.linspace(0, 0.0001, 100))
             correlation = np.correlate(np.abs(signal), np.abs(template), mode='same')
             return np.argmax(correlation)
             
     def calibrate_with_end_cap(self, time, signal):
-        direct_idx = self.find_direct_pulse(signal)
+        direct_idx = self.find_direct_pulse(signal, method='peak')
         expected_delay = (2 * self.pipe_length) / 1480
         search_start = direct_idx + int(0.8 * expected_delay / self.effective_dt)
         search_end = direct_idx + int(1.2 * expected_delay / self.effective_dt)
@@ -102,39 +109,88 @@ class EnhancedLeakDetector:
         lags = np.arange(-len(scenario_trunc) + 1, len(baseline_trunc))
         best_lag = lags[np.argmax(correlation)]
         return best_lag, min_length
-        
-    def detect_leak_echoes(self, baseline_signal, scenario_signal, time, direct_idx):
+    def detect_leak_echoes(self, baseline_signal, scenario_signal, time, direct_idx, top_n=10):
         min_length = min(len(baseline_signal), len(scenario_signal))
         baseline_signal = baseline_signal[:min_length]
         scenario_signal = scenario_signal[:min_length]
         time = time[:min_length]
-        max_time = (2 * self.pipe_length) / self.speed_of_sound
-        max_idx = direct_idx + int(max_time / self.effective_dt)
-        max_idx = min(max_idx, len(time) - 1)
-        search_start = direct_idx + int(0.0001 / self.effective_dt)
-        search_end = max_idx
+        
+        # Find the time range where we expect to see the echo (1.05s to 1.1s)
+        time_start_idx = np.argmin(np.abs(time - 0.02))
+        time_end_idx = np.argmin(np.abs(time - 2.5))
+        
+        # Ensure we have a valid search window
+        if time_end_idx <= time_start_idx:
+            print("Warning: Invalid time window (1.05s-1.1s), using default search range")
+            max_time = (2 * self.pipe_length) / self.speed_of_sound
+            search_start = direct_idx + int(0.0001 / self.effective_dt)
+            search_end = direct_idx + int(max_time / self.effective_dt)
+            search_end = min(search_end, len(time) - 1)
+        else:
+            search_start = time_start_idx
+            search_end = time_end_idx
+        
+        # Ensure we're searching in the correct time range
+        search_start = max(search_start, 0)
+        search_end = min(search_end, len(time) - 1)
+        
+        if search_end <= search_start:
+            print("Warning: Search window is invalid, using default search range")
+            max_time = (2 * self.pipe_length) / self.speed_of_sound
+            search_start = direct_idx + int(0.0001 / self.effective_dt)
+            search_end = direct_idx + int(max_time / self.effective_dt)
+            search_end = min(search_end, len(time) - 1)
+        
+        # Check if the search window is still empty
+        if search_end <= search_start:
+            print("Error: Search window is still empty after adjustments")
+            return [], [], None
+        
         diff_signal = np.abs(scenario_signal) - np.abs(baseline_signal)
         baseline_abs = np.abs(baseline_signal[search_start:search_end])
         scenario_abs = np.abs(scenario_signal[search_start:search_end])
-        norm_diff = (scenario_abs - baseline_abs) / (baseline_abs + 1e-10)
+        
+        # Check if the window is too small for convolution
         window_size = int(0.00005 / self.effective_dt)
         if window_size < 5:
             window_size = 5
+        
+        if len(baseline_abs) < window_size:
+            print("Warning: Search window too small for convolution, adjusting window size")
+            window_size = max(3, len(baseline_abs) // 2)
+        
         energy_baseline = np.convolve(baseline_abs**2, np.ones(window_size)/window_size, mode='same')
         energy_scenario = np.convolve(scenario_abs**2, np.ones(window_size)/window_size, mode='same')
         energy_diff = energy_scenario - energy_baseline
+        
+        norm_diff = (scenario_abs - baseline_abs) / (baseline_abs + 1e-10)
+        
         combined_evidence = np.zeros_like(diff_signal[search_start:search_end])
-        combined_evidence += diff_signal[search_start:search_end] / np.max(np.abs(diff_signal[search_start:search_end]))
-        combined_evidence += norm_diff / np.max(np.abs(norm_diff))
-        combined_evidence += energy_diff / np.max(np.abs(energy_diff))
-        min_height = 0.5
+        combined_evidence += diff_signal[search_start:search_end] / np.max(np.abs(diff_signal[search_start:search_end]) + 1e-10)
+        combined_evidence += norm_diff / np.max(np.abs(norm_diff) + 1e-10)
+        combined_evidence += energy_diff / np.max(np.abs(energy_diff) + 1e-10)
+        
+        min_height = 1.0
         min_distance = int(0.0001 / self.effective_dt)
+        
+        # Ensure we have valid peaks
+        if len(combined_evidence) == 0:
+            print("Warning: No evidence data for peak detection")
+            return [], [], None
+        
         peaks, properties = find_peaks(
             combined_evidence, 
             height=min_height,
             distance=min_distance,
             prominence=0.3
         )
+        
+        if top_n is not None and len(peaks) > 0:
+            # sort peaks by their combined_evidence value (descending) and pick top_n
+            order = np.argsort(combined_evidence[peaks])[::-1]
+            selected = peaks[order[:top_n]]
+            peaks = np.sort(selected)  # optional: keep indices in ascending order
+
         echo_indices = peaks + search_start
         echo_metrics = []
         
@@ -145,7 +201,6 @@ class EnhancedLeakDetector:
             distance = (self.speed_of_sound * time_diff) / 2
             
             # Only consider echoes within the pipe (0 to pipe_length)
-         
             if 0 < distance <= self.pipe_length:
                 echo_metrics.append({
                     'time': time[idx],
@@ -155,95 +210,108 @@ class EnhancedLeakDetector:
                     'evidence': combined_evidence[idx - search_start]
                 })
             else:
-               
                 print(f"  Ignoring echo at {distance:.3f}m (beyond pipe length of {self.pipe_length}m)")
         
         echo_metrics.sort(key=lambda x: x['evidence'], reverse=True)
         primary_leak = echo_metrics[0] if echo_metrics else None
-        return echo_indices, echo_metrics, primary_leak
-        
+        return echo_indices, echo_metrics, primary_leak            
     def plot_detailed_analysis(self, baseline_time, baseline_signal, scenario_signal,
-                             direct_idx, echo_indices, echo_metrics, primary_leak, scenario_name, save_path=None):
-        min_length = min(len(baseline_time), len(scenario_signal))
-        baseline_time = baseline_time[:min_length]
-        baseline_signal = baseline_signal[:min_length]
-        scenario_signal = scenario_signal[:min_length]
-        echo_indices = [idx for idx in echo_indices if idx < min_length]
-        fig, axes = plt.subplots(3, 2, figsize=(15, 12))
-        axes[0, 0].plot(baseline_time, baseline_signal, 'b-', label='Baseline', alpha=0.7)
-        axes[0, 0].plot(baseline_time, scenario_signal, 'r-', label=scenario_name, alpha=0.7)
-        axes[0, 0].axvline(x=baseline_time[direct_idx], color='green', linestyle='--', label='Direct Pulse')
-        axes[0, 0].set_xlabel('Time (s)')
-        axes[0, 0].set_ylabel('Amplitude')
-        axes[0, 0].set_title('Raw Signals')
-        axes[0, 0].legend()
-        axes[0, 0].grid(True, alpha=0.3)
-        zoom_start = max(0, direct_idx - int(0.0005 / self.effective_dt))
-        zoom_end = min(len(baseline_time), direct_idx + int(0.001 / self.effective_dt))
-        axes[0, 1].plot(baseline_time[zoom_start:zoom_end], baseline_signal[zoom_start:zoom_end], 'b-', label='Baseline')
-        axes[0, 1].plot(baseline_time[zoom_start:zoom_end], scenario_signal[zoom_start:zoom_end], 'r-', label=scenario_name)
-        axes[0, 1].axvline(x=baseline_time[direct_idx], color='green', linestyle='--', label='Direct Pulse')
-        axes[0, 1].set_xlabel('Time (s)')
-        axes[0, 1].set_ylabel('Amplitude')
-        axes[0, 1].set_title('Zoomed View: Direct Pulse')
-        axes[0, 1].legend()
-        axes[0, 1].grid(True, alpha=0.3)
-        diff_signal = np.abs(scenario_signal) - np.abs(baseline_signal)
-        axes[1, 0].plot(baseline_time, diff_signal, 'purple', label='Difference (Scenario - Baseline)', alpha=0.7)
-        axes[1, 0].axhline(y=0, color='black', linestyle='-', alpha=0.5)
-        for i, idx in enumerate(echo_indices):
-            if idx < len(baseline_time):
-                is_primary = False
-                for echo in echo_metrics:
-                    if abs(baseline_time[idx] - echo['time']) < 1e-6:
-                        if echo.get('primary', False):
-                            is_primary = True
+                                    direct_idx, echo_indices, echo_metrics, primary_leak, scenario_name, save_path=None):
+            min_length = min(len(baseline_time), len(scenario_signal))
+            baseline_time = baseline_time[:min_length]
+            baseline_signal = baseline_signal[:min_length]
+            scenario_signal = scenario_signal[:min_length]
+
+            # Time relative to direct pulse
+            time_since_direct = baseline_time - baseline_time[direct_idx]
+
+            # Keep only valid echo indices
+            echo_indices = [idx for idx in echo_indices if idx < min_length]
+
+            fig, axes = plt.subplots(3, 1, figsize=(12, 15))
+
+            baseline_legend = "Baseline"
+            scenario_legend = f"Leak at {primary_leak['distance']:.3f}m" if primary_leak else scenario_name
+
+            flipped_time = time_since_direct[::-1]
+            baseline_signal_flipped = baseline_signal
+            scenario_signal_flipped = scenario_signal
+
+            # Raw signals
+            axes[0].plot(flipped_time, baseline_signal_flipped, color='blue', linestyle='-', label=baseline_legend, alpha=0.7)
+            axes[0].plot(flipped_time, scenario_signal_flipped, color='red', linestyle='-', label=scenario_legend, alpha=0.7)
+            axes[0].set_xlabel('Time Before Direct Pulse (s)')
+            axes[0].set_ylabel('Amplitude')
+            axes[0].set_title('Raw Signals')
+            axes[0].legend()
+            axes[0].grid(True, alpha=0.3)
+            if len(flipped_time) > 0:
+                axes[0].set_xlim(0, flipped_time[0])
+
+            # Difference signal (no point markers)
+            diff_signal = np.abs(scenario_signal_flipped) - np.abs(baseline_signal_flipped)
+            diff_legend = 'Difference (|Scenario| - |Baseline|)'
+            axes[1].plot(flipped_time, diff_signal, color='purple', label=diff_legend, alpha=0.7)
+            axes[1].axhline(y=0, color='black', linestyle='-', alpha=0.5)
+
+            # Annotate echoes without plotting decorative markers
+            for i, idx in enumerate(echo_indices):
+                flipped_idx = len(flipped_time) - 1 - idx
+                if 0 <= flipped_idx < len(flipped_time):
+                    echo_distance = None
+                    is_primary = False
+
+                    # Match echo index to metrics by time_diff
+                    for echo in echo_metrics:
+                        if abs(time_since_direct[idx] - echo['time_diff']) < 1e-6:
+                            echo_distance = echo['distance']
+                            is_primary = bool(echo.get('primary', False))
                             break
-                color = 'green' if is_primary else 'red'
-                marker = '*' if is_primary else 'o'
-                size = 12 if is_primary else 8
-                axes[1, 0].plot(baseline_time[idx], diff_signal[idx], marker, color=color, markersize=size)
-                label = f'Primary Leak' if is_primary else f'Echo {i+1}'
-                axes[1, 0].annotate(label, xy=(baseline_time[idx], diff_signal[idx]),
-                                   xytext=(10, 10), textcoords='offset points',
-                                   arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=0'))
-        axes[1, 0].set_xlabel('Time (s)')
-        axes[1, 0].set_ylabel('Amplitude Difference')
-        axes[1, 0].set_title('Difference Signal (|Scenario| - |Baseline|)')
-        axes[1, 0].legend()
-        axes[1, 0].grid(True, alpha=0.3)
-        f, t, Zxx = stft(diff_signal, fs=self.effective_sampling_rate, nperseg=256)
-        im = axes[1, 1].pcolormesh(t, f/1000, np.abs(Zxx), shading='gouraud', cmap='viridis')
-        axes[1, 1].set_ylabel('Frequency (kHz)')
-        axes[1, 1].set_xlabel('Time (s)')
-        axes[1, 1].set_title('Spectrogram of Difference Signal')
-        plt.colorbar(im, ax=axes[1, 1], label='Magnitude')
-        if echo_metrics:
-            distances = [echo['distance'] for echo in echo_metrics]
-            evidence = [echo['evidence'] for echo in echo_metrics]
-            is_primary = [echo.get('primary', False) for echo in echo_metrics]
-            colors = ['green' if primary else 'orange' for primary in is_primary]
-            bars = axes[2, 0].bar(range(len(distances)), distances, color=colors, alpha=0.7)
-            axes[2, 0].set_xlabel('Echo Number')
-            axes[2, 0].set_ylabel('Distance (m)')
-            axes[2, 0].set_title('Estimated Leak Distances (Green = Primary)')
-            for i, (d, e, primary) in enumerate(zip(distances, evidence, is_primary)):
-                text_color = 'black' if not primary else 'green'
-                weight = 'bold' if primary else 'normal'
-                axes[2, 0].text(i, d, f'{d:.3f}m\n(conf: {e:.2f})', ha='center', va='bottom', 
-                               color=text_color, weight=weight)
-        axes[2, 1].hist(np.abs(baseline_signal), bins=50, alpha=0.7, label='Baseline', color='blue')
-        axes[2, 1].hist(np.abs(scenario_signal), bins=50, alpha=0.7, label=scenario_name, color='red')
-        axes[2, 1].set_xlabel('Amplitude')
-        axes[2, 1].set_ylabel('Count')
-        axes[2, 1].set_title('Amplitude Distribution')
-        axes[2, 1].legend()
-        axes[2, 1].grid(True, alpha=0.3)
-        plt.tight_layout()
-        if save_path:
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        plt.show()
-        
+
+                    if echo_distance is None:
+                        continue
+
+                    # Use colored annotation text (green for primary, red for others)
+                    # annot_color = 'green' if is_primary else 'red'
+                    # label = f"Primary Leak: {echo_distance:.3f} m" if is_primary else f"Echo {i+1}: {echo_distance:.3f} m"
+                    # axes[1].annotate(label,
+                                    # xy=(flipped_time[flipped_idx], diff_signal[flipped_idx]),
+                                    # xytext=(10, 10),
+                                    # textcoords='offset points',
+                                    # color=annot_color,
+                                    # arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=0', color=annot_color))
+
+            axes[1].set_xlabel('Time Before Direct Pulse (s)')
+            axes[1].set_ylabel('Amplitude Difference')
+            axes[1].set_title('Difference Signal')
+            axes[1].legend()
+            axes[1].grid(True, alpha=0.3)
+            if len(flipped_time) > 0:
+                axes[1].set_xlim(0, flipped_time[0])
+
+            # Distance bar chart
+            if echo_metrics:
+                distances = [echo['distance'] for echo in echo_metrics]
+                evidence = [echo['evidence'] for echo in echo_metrics]
+                is_primary = [echo.get('primary', False) for echo in echo_metrics]
+                colors = ['green' if primary else 'orange' for primary in is_primary]
+                bars = axes[2].bar(range(len(distances)), distances, color=colors, alpha=0.7)
+                axes[2].set_xlabel('Echo Number')
+                axes[2].set_ylabel('Distance (m)')
+                axes[2].set_title('Estimated Leak Distances (Green = Primary)')
+
+                for i, (d, e, primary) in enumerate(zip(distances, evidence, is_primary)):
+                    text_color = 'green' if primary else 'black'
+                    weight = 'bold' if primary else 'normal'
+                    axes[2].text(i, d, f'{d:.3f} m\n(conf: {e:.2f})', ha='center', va='bottom', color=text_color, weight=weight)
+            else:
+                axes[2].text(0.5, 0.5, 'No echoes detected', ha='center', va='center', transform=axes[2].transAxes)
+                axes[2].set_title('Estimated Leak Distances')
+
+            plt.tight_layout()
+            if save_path:
+                plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            plt.show()
     def analyze_scenario(self, baseline_path, scenario_path, output_dir):
         baseline_time, baseline_raw = self.load_and_preprocess(baseline_path)
         scenario_time, scenario_raw = self.load_and_preprocess(scenario_path)
