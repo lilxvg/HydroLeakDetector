@@ -1,10 +1,4 @@
-%% HydroLeak Quick Start Script
-% Simple usage example for the HydroLeak system
-%
-% Usage:
-%   1. Connect ESP32-C6 to USB
-%   2. Run this script
-%   3. Follow prompts
+
 
 clear; clc; close all;
 
