@@ -1,12 +1,4 @@
-%% HydroLeak Signal Processing Functions
-% Advanced signal processing routines for leak detection
-%
-% Functions:
-%   - generateZadoffChu: Create ZC sequence
-%   - generateGoldCode: Create Gold spreading code
-%   - cyclicCorrelation: Efficient cyclic correlation
-%   - leakLocalizer: Multi-method leak localization
-%   - snrEstimator: Estimate signal-to-noise ratio
+
 
 %% Generate Zadoff-Chu Sequence
 function zc = generateZadoffChu(length, root)
