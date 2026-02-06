@@ -1,12 +1,3 @@
-%% HydroLeak System Verification Script
-% Complete test suite for validating the acoustic leak detection system
-%
-% Tests:
-%   1. Signal generation verification
-%   2. Correlation validation
-%   3. Distance calculation accuracy
-%   4. Multi-method fusion testing
-%   5. Full simulation benchmark
 
 clear; clc; close all;
 
