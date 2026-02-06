@@ -1,17 +1,4 @@
-%% HydroLeak Acoustic Leak Detection System - MATLAB Interface
-% Complete control and analysis for ESP32-C6 based leak detection
-%
-% Features:
-%   - Serial communication with ESP32
-%   - Real-time data acquisition
-%   - Multi-method fusion for leak detection
-%   - Result visualization and export
-%
-% Hardware: ESP32-C6 + PCM1808 ADC + PCM5102A DAC + AS-1 Hydrophone
-% Pipe: 1m length, valves at 0.25m intervals
-%
-% Author: HydroLeak Engineering Team
-% Date: February 2026
+
 
 classdef HydroLeak < handle
     properties
