@@ -1,18 +1,4 @@
-/**
- * HydroLeak Acoustic Leak Detection System
- * ESP32-C6 Firmware with PCM1808 ADC and PCM5102A DAC
- * 
- * Signal Chain:
- *   TX: ESP32 -> I2S -> PCM5102A DAC -> Acoustic Transducer -> Pipe
- *   RX: Pipe -> Hydrophone -> Preamp -> PCM1808 ADC -> I2S -> ESP32
- * 
- * Detection Method:
- *   - Zadoff-Chu preamble for synchronization
- *   - Gold code spread spectrum for noise immunity
- *   - Pulse-echo with leak reflection detection
- *   - Multi-burst averaging for SNR improvement
- *   - Cyclic correlation for precise timing
- */
+
 
 #include <Arduino.h>
 #include <driver/i2s.h>
